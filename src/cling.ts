@@ -1,10 +1,12 @@
-import { getPreferenceValues } from "@raycast/api";
+import { Cache, getPreferenceValues } from "@raycast/api";
 import { execFileSync } from "child_process";
-import { existsSync } from "fs";
+import { existsSync, statSync } from "fs";
 import { homedir } from "os";
 import { basename } from "path";
 
 const HOME = homedir();
+const PLIST_PATH = `${HOME}/Library/Preferences/com.lowtechguys.Cling.plist`;
+const persistentCache = new Cache({ namespace: "cling-app-resolver" });
 const FALLBACK_CLI = "/Applications/Cling.app/Contents/SharedSupport/ClingCLI";
 
 let cachedCLI: string | null = null;
@@ -32,18 +34,58 @@ export function clingInstalled(): boolean {
   return existsSync(resolveClingCLI());
 }
 
-const defaultsCache = new Map<string, string | undefined>();
+const KNOWN_DEFAULT_KEYS = ["terminalApp", "editorApp", "shelfApp", "copyPathsWithTilde"] as const;
+
+type DefaultsSnapshot = {
+  plistMtimeMs: number;
+  values: Record<string, string | undefined>;
+};
+
+function plistMtimeMs(): number {
+  try {
+    return statSync(PLIST_PATH).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
+let defaultsSnapshot: DefaultsSnapshot | null = null;
+
+function loadDefaults(): DefaultsSnapshot {
+  if (defaultsSnapshot) return defaultsSnapshot;
+  const mtime = plistMtimeMs();
+
+  const raw = persistentCache.get("defaults");
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw) as DefaultsSnapshot;
+      if (parsed.plistMtimeMs === mtime) {
+        defaultsSnapshot = parsed;
+        return parsed;
+      }
+    } catch {
+      // fall through
+    }
+  }
+
+  const values: Record<string, string | undefined> = {};
+  for (const key of KNOWN_DEFAULT_KEYS) {
+    try {
+      values[key] = execFileSync("defaults", ["read", "com.lowtechguys.Cling", key], {
+        encoding: "utf-8",
+      }).trim();
+    } catch {
+      values[key] = undefined;
+    }
+  }
+
+  defaultsSnapshot = { plistMtimeMs: mtime, values };
+  persistentCache.set("defaults", JSON.stringify(defaultsSnapshot));
+  return defaultsSnapshot;
+}
 
 export function getClingDefault(key: string): string | undefined {
-  if (defaultsCache.has(key)) return defaultsCache.get(key);
-  let result: string | undefined;
-  try {
-    result = execFileSync("defaults", ["read", "com.lowtechguys.Cling", key], { encoding: "utf-8" }).trim();
-  } catch {
-    result = undefined;
-  }
-  defaultsCache.set(key, result);
-  return result;
+  return loadDefaults().values[key];
 }
 
 const SHELF_BUNDLE_IDS = [
@@ -57,6 +99,20 @@ let detectedShelfApp: { value: string | undefined } | null = null;
 
 function detectShelfApp(): string | undefined {
   if (detectedShelfApp) return detectedShelfApp.value;
+
+  const raw = persistentCache.get("shelf");
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw) as { path: string | undefined };
+      if (parsed.path && existsSync(parsed.path)) {
+        detectedShelfApp = { value: parsed.path };
+        return parsed.path;
+      }
+    } catch {
+      // fall through
+    }
+  }
+
   let value: string | undefined;
   for (const bundleID of SHELF_BUNDLE_IDS) {
     try {
@@ -71,7 +127,13 @@ function detectShelfApp(): string | undefined {
       continue;
     }
   }
+
   detectedShelfApp = { value };
+  if (value) {
+    persistentCache.set("shelf", JSON.stringify({ path: value }));
+  } else if (raw) {
+    persistentCache.remove("shelf");
+  }
   return value;
 }
 
@@ -92,6 +154,11 @@ function fromPath(path: string): AppRef {
   return { name: basename(path, ".app"), path };
 }
 
+function fromValidPath(path: string | undefined): AppRef | undefined {
+  if (!path || !existsSync(path)) return undefined;
+  return fromPath(path);
+}
+
 function findApp(paths: string[]): AppRef | undefined {
   const path = paths.find((p) => existsSync(p));
   return path ? fromPath(path) : undefined;
@@ -104,13 +171,11 @@ let cachedShelf: { value: AppRef | undefined } | null = null;
 export function getTerminalApp(): AppRef {
   if (cachedTerminal) return cachedTerminal.value;
   const prefs = getPreferenceValues<Preferences>();
-  let value: AppRef;
-  if (prefs.terminalApp) {
-    value = { name: prefs.terminalApp.name, path: prefs.terminalApp.path };
-  } else {
-    const def = getClingDefault("terminalApp");
-    value = def ? fromPath(def) : (findApp(TERMINAL_FALLBACKS) ?? { name: "Terminal", path: undefined });
-  }
+
+  const value: AppRef = fromValidPath(prefs.terminalApp?.path) ??
+    fromValidPath(getClingDefault("terminalApp")) ??
+    findApp(TERMINAL_FALLBACKS) ?? { name: "Terminal", path: undefined };
+
   cachedTerminal = { value };
   return value;
 }
@@ -118,15 +183,12 @@ export function getTerminalApp(): AppRef {
 export function getEditorApp(): AppRef {
   if (cachedEditor) return cachedEditor.value;
   const prefs = getPreferenceValues<Preferences>();
-  let value: AppRef;
-  if (prefs.editorApp) {
-    value = { name: prefs.editorApp.name, path: prefs.editorApp.path };
-  } else {
-    const def = getClingDefault("editorApp");
-    value = (def ? fromPath(def) : undefined) ??
-      findApp(VSCODE_PATHS) ??
-      findApp(TEXT_EDIT_FALLBACKS) ?? { name: "TextEdit", path: undefined };
-  }
+
+  const value: AppRef = fromValidPath(prefs.editorApp?.path) ??
+    fromValidPath(getClingDefault("editorApp")) ??
+    findApp(VSCODE_PATHS) ??
+    findApp(TEXT_EDIT_FALLBACKS) ?? { name: "TextEdit", path: undefined };
+
   cachedEditor = { value };
   return value;
 }
@@ -134,18 +196,13 @@ export function getEditorApp(): AppRef {
 export function getShelfApp(): AppRef | undefined {
   if (cachedShelf) return cachedShelf.value;
   const prefs = getPreferenceValues<Preferences>();
-  let value: AppRef | undefined;
-  if (prefs.shelfApp) {
-    value = { name: prefs.shelfApp.name, path: prefs.shelfApp.path };
-  } else {
-    const def = getClingDefault("shelfApp");
-    if (def) {
-      value = fromPath(def);
-    } else {
-      const detected = detectShelfApp();
-      value = detected ? fromPath(detected) : undefined;
-    }
+
+  let value: AppRef | undefined = fromValidPath(prefs.shelfApp?.path) ?? fromValidPath(getClingDefault("shelfApp"));
+  if (!value) {
+    const detected = detectShelfApp();
+    value = detected ? fromPath(detected) : undefined;
   }
+
   cachedShelf = { value };
   return value;
 }
